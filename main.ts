@@ -1,10 +1,8 @@
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 
-// یک UUID معتبر برای خودت (می‌توانی تغییرش دهی)
 const USER_UUID = "7c9e663a-62a2-4a02-a1f9-4d6d390a3c9e"; 
 const WS_PATH = "/secure-edge-stream-99";
 
-// باز کردن دیتابیس داخلی دنو
 const kv = await Deno.openKv();
 
 const DENO_IP_POOL = [
@@ -16,16 +14,12 @@ const DENO_IP_POOL = [
   "151.101.129.121"
 ];
 
-// این بخش هر ۱۲ ساعت یک‌بار خودکار در پس‌زمینه آی‌پی‌های تمیز را پیدا و ذخیره می‌کند
-Deno.cron("Auto IP Scanner", "0 */12 * * *", async () => {
-  console.log("Cron Job Started: Scanning for clean IPs...");
-  const cleanIPs: string[] = [];
-  
+// تابع تست زنده بودن آی‌پی‌ها
+async function scanAndGetIPs(): Promise<string[]> {
   const tasks = DENO_IP_POOL.map(async (ip) => {
     try {
       const controller = new AbortController();
-      const id = setTimeout(() => controller.abort(), 1500);
-
+      const id = setTimeout(() => controller.abort(), 1200);
       await fetch(`https://${ip}`, { method: "HEAD", signal: controller.signal, headers: { "Host": "deno.dev" } });
       clearTimeout(id);
       return { ip, success: true };
@@ -36,21 +30,28 @@ Deno.cron("Auto IP Scanner", "0 */12 * * *", async () => {
 
   const results = await Promise.all(tasks);
   const filtered = results.filter(r => r.success).map(r => r.ip);
+  return filtered.length > 0 ? filtered : ["151.101.65.121", "151.101.2.132"];
+}
 
-  if (filtered.length > 0) {
-    await kv.set(["clean_ips"], filtered);
-    console.log("Database updated with clean IPs:", filtered);
-  }
+// کرون‌جاب ۱2 ساعته در پس‌زمینه
+Deno.cron("Auto IP Scanner", "0 */12 * * *", async () => {
+  const filtered = await scanAndGetIPs();
+  await kv.set(["clean_ips"], filtered);
 });
 
 async function handler(req: Request): Promise<Response> {
   const url = new URL(req.url);
   const host = url.hostname;
 
-  // بخش تحویل ساب‌اسکریپشن
   if (url.pathname === "/sub") {
     const res = await kv.get<string[]>(["clean_ips"]);
-    const cleanIPs = res.value || ["151.101.65.121", "151.101.2.132"];
+    let cleanIPs = res.value;
+
+    // ترفند اصلی: اگر بار اول دیتابیس خالی بود، درجا خودش اسکن کند و منتظر کرون‌جاب نماند
+    if (!cleanIPs || cleanIPs.length === 0) {
+      cleanIPs = await scanAndGetIPs();
+      await kv.set(["clean_ips"], cleanIPs); 
+    }
 
     const configs = cleanIPs.map((ip, index) => 
       `vless://${USER_UUID}@${ip}:443?encryption=none&security=tls&sni=${host}&type=ws&host=${host}&path=${encodeURIComponent(WS_PATH)}#Deno-Auto-${index + 1}`
@@ -58,18 +59,20 @@ async function handler(req: Request): Promise<Response> {
 
     return new Response(btoa(configs.join("\n")), {
       status: 200,
-      headers: { "Content-Type": "text/plain; charset=utf-8", "Access-Control-Allow-Origin": "*" }
+      headers: { 
+        "Content-Type": "text/plain; charset=utf-8", 
+        "Access-Control-Allow-Origin": "*",
+        "Cache-Control": "no-store"
+      }
     });
   }
 
-  // بخش پردازش ترافیک وب‌سوکت پروکسی
   if (url.pathname === WS_PATH && req.headers.get("upgrade") === "websocket") {
-    const { socket, response } = Deno.upgradeWebSocket(req);
-    // منطق ریلی دیتا در اینجا به صورت سرورلس هندل می‌شود
+    const { response } = Deno.upgradeWebSocket(req);
     return response;
   }
 
-  return new Response("Not Found", { status: 404 });
+  return new Response("Deno Edge Active", { status: 200 });
 }
 
 serve(handler);
